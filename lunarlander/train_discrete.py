@@ -53,6 +53,14 @@ EVAL_EPS = 0.01
 
 EVAL_EVERY = 25_000
 EVAL_EPISODES = 5
+
+# NOTE: RL has no "epoch" (there is no fixed dataset to iterate over).
+# The closest unit is an *episode* -- one launch until crash / landing / timeout.
+# 400k agent steps is only ~3-6k episodes, so episode-based saving is sparse;
+# the step-based autosave below is what actually protects against a crash.
+SAVE_EVERY_EPISODES = 200     # milestone checkpoint every N episodes (0 disables)
+AUTOSAVE_EVERY_STEPS = 10_000  # overwrite qnet_latest.pt every N steps (0 disables)
+KEEP_LAST_CKPTS = 0            # 0 = keep every milestone, N = keep newest N
 SAVE_DIR = "dqn_lander_image_ckpt"
 
 
@@ -277,6 +285,54 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def save_ckpt(agent, path, step, episode):
+    """Full checkpoint: weights + optimizer state + counters (resumable).
+
+    Writes to a temp file then atomically renames, so a crash mid-save
+    cannot leave a corrupted checkpoint behind.
+    """
+    tmp = path + ".tmp"
+    torch.save({
+        "model": agent.online.state_dict(),
+        "target": agent.target.state_dict(),
+        "opt": agent.opt.state_dict(),
+        "updates": agent.updates,
+        "step": step,
+        "episode": episode,
+    }, tmp)
+    os.replace(tmp, path)
+
+
+def load_ckpt(agent, path):
+    """Accepts both the full dict format and a bare state_dict."""
+    ck = torch.load(path, map_location=DEVICE)
+    if isinstance(ck, dict) and "model" in ck:
+        agent.online.load_state_dict(ck["model"])
+        agent.target.load_state_dict(ck.get("target", ck["model"]))
+        if "opt" in ck:
+            agent.opt.load_state_dict(ck["opt"])
+        agent.updates = int(ck.get("updates", 0))
+        return int(ck.get("step", 0)), int(ck.get("episode", 0))
+    agent.online.load_state_dict(ck)
+    agent.target.load_state_dict(ck)
+    return 0, 0
+
+
+def prune_ckpts(pattern_dir, prefix, keep):
+    """Delete old periodic checkpoints, keeping only the newest `keep` files."""
+    if keep <= 0:
+        return
+    files = sorted(
+        (f for f in os.listdir(pattern_dir) if f.startswith(prefix)),
+        key=lambda f: os.path.getmtime(os.path.join(pattern_dir, f)),
+    )
+    for f in files[:-keep]:
+        try:
+            os.remove(os.path.join(pattern_dir, f))
+        except OSError:
+            pass
+
+
 @torch.no_grad()
 def evaluate(agent, episodes=EVAL_EPISODES, human=False, seed=None):
     env = PixelLunarLander(human=human)
@@ -297,17 +353,22 @@ def evaluate(agent, episodes=EVAL_EPISODES, human=False, seed=None):
 # ----------------------------------------------------------------------
 # Training
 # ----------------------------------------------------------------------
-def train(total_steps=TOTAL_STEPS, seed=SEED, resume=None):
+def train(total_steps=TOTAL_STEPS, seed=SEED, resume=None,
+          save_every_episodes=SAVE_EVERY_EPISODES,
+          autosave_every_steps=AUTOSAVE_EVERY_STEPS,
+          keep_last=KEEP_LAST_CKPTS):
     os.makedirs(SAVE_DIR, exist_ok=True)
     set_seed(seed)
 
     env = PixelLunarLander()
     env.seed_spaces(seed)
     agent = DQNAgent(FRAME_STACK, env.n_actions)
+
+    start_step, episode = 0, 0
     if resume:
-        agent.online.load_state_dict(torch.load(resume, map_location=DEVICE))
-        agent.target.load_state_dict(agent.online.state_dict())
-        print(f"Resumed from {resume}")
+        start_step, episode = load_ckpt(agent, resume)
+        print(f"Resumed from {resume} (step={start_step}, episode={episode}). "
+              f"Note: the replay buffer is NOT saved and starts empty.")
 
     buffer = ReplayBuffer(BUFFER_SIZE)
     s = env.reset(seed=seed)
@@ -317,7 +378,7 @@ def train(total_steps=TOTAL_STEPS, seed=SEED, resume=None):
     last_loss = None
     t0 = time.time()
 
-    for step in range(1, total_steps + 1):
+    for step in range(start_step + 1, total_steps + 1):
         eps = 1.0 if step < LEARN_START else epsilon_at(step - LEARN_START)
         a = agent.act(s, eps)
         s2, r, terminated, truncated = env.step(a)
@@ -329,7 +390,18 @@ def train(total_steps=TOTAL_STEPS, seed=SEED, resume=None):
         s = s2
 
         if terminated or truncated:
+            episode += 1
             recent.append(ep_ret)
+
+            # ---- milestone checkpoint, one file per N episodes ----
+            if save_every_episodes > 0 and episode % save_every_episodes == 0:
+                path = os.path.join(SAVE_DIR, f"qnet_ep{episode:06d}.pt")
+                save_ckpt(agent, path, step, episode)
+                print(f"  [milestone] episode {episode} (step {step}) -> "
+                      f"{os.path.basename(path)} | "
+                      f"Last20Avg={np.mean(recent):.1f}")
+                prune_ckpts(SAVE_DIR, "qnet_ep", keep_last)
+
             s = env.reset()
             ep_ret, ep_len = 0.0, 0
 
@@ -340,32 +412,37 @@ def train(total_steps=TOTAL_STEPS, seed=SEED, resume=None):
             fps = step * ACTION_REPEAT / (time.time() - t0)
             avg20 = np.mean(recent) if recent else float("nan")
             loss_str = f"{last_loss:.4f}" if last_loss is not None else "N/A"
-            print(f"[{step}/{total_steps}] eps={eps:.3f} | "
+            print(f"[{step}/{total_steps}] ep={episode} | eps={eps:.3f} | "
                   f"Last20Avg={avg20:7.1f} | loss={loss_str} | "
                   f"buffer={len(buffer)} | env_fps={fps:.0f}")
 
+        # ---- rolling autosave (crash recovery): always one small file ----
+        if autosave_every_steps > 0 and step % autosave_every_steps == 0:
+            save_ckpt(agent, os.path.join(SAVE_DIR, "qnet_latest.pt"),
+                      step, episode)
+
         if step % EVAL_EVERY == 0 and step >= LEARN_START:
             m, sd = evaluate(agent, seed=seed)
-            print(f"  >> eval @ {step}: {m:.1f} +/- {sd:.1f}")
-            torch.save(agent.online.state_dict(),
-                       os.path.join(SAVE_DIR, f"qnet_{step}.pt"))
+            print(f"  >> eval @ step {step} (ep {episode}): {m:.1f} +/- {sd:.1f}")
             if m > best_eval:
                 best_eval = m
-                torch.save(agent.online.state_dict(),
-                           os.path.join(SAVE_DIR, "qnet_best.pt"))
+                save_ckpt(agent, os.path.join(SAVE_DIR, "qnet_best.pt"),
+                          step, episode)
                 print(f"  >> new best ({m:.1f}), saved qnet_best.pt")
 
     env.close()
-    torch.save(agent.online.state_dict(), os.path.join(SAVE_DIR, "qnet_final.pt"))
-    print("Training finished.")
+    save_ckpt(agent, os.path.join(SAVE_DIR, "qnet_final.pt"), total_steps, episode)
+    print(f"Training finished. {episode} episodes over {total_steps} agent steps "
+          f"({total_steps * ACTION_REPEAT} env frames).")
 
 
 def play(ckpt, episodes=5, human=True):
     env = PixelLunarLander()
     agent = DQNAgent(FRAME_STACK, env.n_actions)
     env.close()
-    agent.online.load_state_dict(torch.load(ckpt, map_location=DEVICE))
+    step, episode = load_ckpt(agent, ckpt)
     agent.online.eval()
+    print(f"loaded {ckpt} (step={step}, episode={episode})")
     m, sd = evaluate(agent, episodes=episodes, human=human)
     print(f"{episodes} episodes: {m:.1f} +/- {sd:.1f}")
 
@@ -377,13 +454,22 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=SEED)
     p.add_argument("--ckpt", type=str, default=None)
     p.add_argument("--episodes", type=int, default=5)
+    p.add_argument("--save-every-episodes", type=int, default=SAVE_EVERY_EPISODES,
+                   help="milestone checkpoint every N episodes (0 disables)")
+    p.add_argument("--autosave-every-steps", type=int, default=AUTOSAVE_EVERY_STEPS,
+                   help="overwrite qnet_latest.pt every N agent steps (0 disables)")
+    p.add_argument("--keep-last", type=int, default=KEEP_LAST_CKPTS,
+                   help="keep only the newest N milestone checkpoints (0 = all)")
     p.add_argument("--no-window", action="store_true",
                    help="play without opening a render window")
     args = p.parse_args()
 
     print(f"device: {DEVICE}")
     if args.mode == "train":
-        train(total_steps=args.steps, seed=args.seed, resume=args.ckpt)
+        train(total_steps=args.steps, seed=args.seed, resume=args.ckpt,
+              save_every_episodes=args.save_every_episodes,
+              autosave_every_steps=args.autosave_every_steps,
+              keep_last=args.keep_last)
     else:
         ckpt = args.ckpt or os.path.join(SAVE_DIR, "qnet_best.pt")
         play(ckpt, episodes=args.episodes, human=not args.no_window)
